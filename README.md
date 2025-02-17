@@ -11,3 +11,6 @@ A [SPICE](https://www.spice-space.org/)(Simple Protocol for Independent Computin
 1. Only Linux is supported now.
 2. Auth and inputs is unsupported yet.
 
+# License
+
+MIT
