@@ -4,7 +4,7 @@ import React from "react";
 
 function initWindow(): DeftWindow {
     const window = globalThis.mainWindow || (globalThis.mainWindow = new DeftWindow({
-        title: 'Deft App',
+        title: 'TinySpice',
     }));
     window.bindResize((e: IResizeEvent) => {
         console.log("window resized", e);

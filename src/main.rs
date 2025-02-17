@@ -1,7 +1,10 @@
+mod spice_backend;
+
 use deft::app::{App, IApp};
 use deft::bootstrap;
 use deft::js::js_engine::JsEngine;
 use std::env;
+use crate::spice_backend::SpiceBackend;
 
 struct MyApp {}
 
@@ -10,6 +13,8 @@ impl IApp for MyApp {
         js_engine
             .eval_module(include_str!("../dev-hack.js"), "dev-hack.js")
             .unwrap();
+        js_engine.add_global_functions(SpiceBackend::create_js_apis());
+        js_engine.eval_module(include_str!("spice.js"), "spice.js").unwrap();
     }
 
     fn create_module_loader(
