@@ -1,4 +1,4 @@
-use deft::base::Rect;
+use deft::base::{EventContext, Rect};
 use deft::element::{Element, ElementBackend, ElementWeak};
 use deft::event_loop::create_event_loop_fn_mut;
 use deft::js::JsError;
@@ -7,13 +7,19 @@ use deft::{bind_js_event_listener, js_weak_value, ok_or_return, some_or_return, 
 use deft_macros::{event, js_methods, mrc_object};
 use deft_skia_safe::{AlphaType, Bitmap, ColorSpace, ColorType, FilterMode, Image, ImageInfo, MipmapMode, Paint, SamplingOptions};
 use spice_client_glib::prelude::{Cast, ChannelExt};
-use spice_client_glib::{glib, ChannelEvent, DisplayChannel, MainChannel, Session};
+use spice_client_glib::{glib, ChannelEvent, DisplayChannel, InputsChannel, MainChannel, MouseButton, MouseButtonMask, Session};
 use std::{slice, thread};
+use std::any::Any;
+use std::sync::{mpsc, Arc, Mutex};
+use std::sync::mpsc::Sender;
+use deft::event::{KeyDownEvent, KeyUpEvent, MouseDownEvent, MouseMoveEvent, MouseUpEvent};
 
 #[mrc_object]
 pub struct SpiceBackend {
     element_weak: ElementWeak,
     image_holder: Option<Image>,
+    input_sender: Option<Sender<InputEvent>>,
+    pressed_button: Option<MouseButton>,
 }
 
 js_weak_value!(SpiceBackend, SpiceBackendWeak);
@@ -31,6 +37,29 @@ pub struct ConnectSuccessEvent;
 pub struct ConnectFailEvent {
     reason: i32,
     message: String,
+}
+
+#[derive(Default)]
+struct SpiceSessionState {
+    display: Option<DisplayChannel>,
+    inputs: Option<InputsChannel>,
+}
+
+unsafe impl Send for SpiceSessionState {}
+unsafe impl Sync for SpiceSessionState {}
+
+enum InputEvent {
+    Position(i32, i32, Option<MouseButton>),
+    ButtonPress(MouseButton),
+    ButtonRelease(MouseButton),
+    KeyPress(u32),
+    KeyRelease(u32),
+}
+
+struct RenderData {
+    img: Image,
+    render_rect: Rect,
+    scale: f32,
 }
 
 
@@ -78,19 +107,30 @@ impl SpiceBackend {
             });
         });
 
+        let (sender, receiver) = mpsc::channel();
+        self.input_sender.replace(sender);
+
         thread::spawn(move || {
             let session = Session::new();
             session.set_uri(Some(&uri));
             //TODO support password
+            let session_state = Arc::new(Mutex::new(SpiceSessionState::default()));
+            let ss = session_state.clone();
             session.connect_channel_new(move |_, channel| {
                 let channel_type = channel.channel_type();
                 println!("channel type: {:?}", channel_type);
                 let conn_success_callback = conn_success_callback.clone();
                 let conn_fail_callback = conn_fail_callback.clone();
                 if let Ok(mc) = channel.clone().downcast::<MainChannel>() {
+                    mc.connect_mouse_mode_notify(|channel| {
+                        let mode = channel.mouse_mode();
+                        println!("mouse mode: {}", mode);
+                    });
                     mc.connect_channel_event(move |channel, event| {
                         match event {
                             ChannelEvent::Opened => {
+                                let mode = channel.mouse_mode();
+                                println!("mouse mode: {}", mode);
                                 conn_success_callback.clone().call(());
                             },
                             ChannelEvent::Closed => {},
@@ -123,6 +163,12 @@ impl SpiceBackend {
                         }
                     });
                 }
+                if let Ok(ic) = channel.clone().downcast::<InputsChannel>() {
+                    ChannelExt::connect(&ic);
+                    let ss = session_state.clone();
+                    let mut ss = ss.lock().unwrap();
+                    ss.inputs = Some(ic);
+                }
                 if let Ok(display) = channel.clone().downcast::<DisplayChannel>() {
                     ChannelExt::connect(&display);
                     let display_open_callback = display_open_callback.clone();
@@ -135,9 +181,7 @@ impl SpiceBackend {
                             ChannelEvent::Closed => {
                                 display_close_callback.clone().call(());
                             },
-                            _ => {
-
-                            }
+                            _ => {}
                         }
                         dbg!((channel, event));
                     });
@@ -182,6 +226,40 @@ impl SpiceBackend {
             session.connect();
 
             let main_context = glib::MainContext::default();
+            let mc = main_context.clone();
+            thread::spawn(move || {
+                loop {
+                    let e = ok_or_return!(receiver.recv());
+                    let ss = ss.clone();
+                    mc.invoke(move || {
+                        let mut ss = ss.lock().unwrap();
+                        let ic = some_or_return!(&mut ss.inputs);
+                        match e {
+                            InputEvent::Position(x, y, btn) => {
+                                //println!("position: {:?}", (x, y));
+                                let btn = btn.map(|b| get_button_mask(b));
+                                ic.position(x, y, 0, btn.unwrap_or(0));
+                            }
+                            InputEvent::ButtonPress(b) => {
+                                //println!("button pressed: {:?}", b);
+                                let mask = get_button_mask(b);
+                                ic.button_press(b as i32, mask);
+                            }
+                            InputEvent::ButtonRelease(b) => {
+                                //println!("button released: {:?}", b);
+                                let mask = get_button_mask(b);
+                                ic.button_release(b as i32, mask);
+                            }
+                            InputEvent::KeyPress(scancode) => {
+                                ic.key_press(scancode);
+                            }
+                            InputEvent::KeyRelease(scancode) => {
+                                ic.key_release(scancode);
+                            }
+                        }
+                    });
+                }
+            });
             let main_loop = glib::MainLoop::new(Some(&main_context), false);
             main_loop.run();
         });
@@ -199,6 +277,30 @@ impl SpiceBackend {
         );
         Ok(id)
     }
+
+
+    fn get_render_data(&self) -> Option<RenderData> {
+        let img = self.image_holder.clone()?;
+        let el = self.element_weak.upgrade_mut().ok()?;
+        let (width, height) = el.get_size();
+        let (img_width, img_height) = (img.width()  as f32, img.height() as f32);
+        let mut w = width;
+        let mut h = w / img_width * img_height;
+        if h > height {
+            h = height;
+            w = img_width / img_height * h;
+        }
+        let x = (width - w) / 2.0;
+        let y = (height - h) / 2.0;
+        let scale = w / img_width;
+        let data = RenderData {
+            img,
+            render_rect: Rect::new(x, y, w, h),
+            scale,
+        };
+        Some(data)
+    }
+
 }
 
 // #[js_methods]
@@ -210,6 +312,8 @@ impl ElementBackend for SpiceBackend {
         SpiceBackendData {
             element_weak: element.as_weak(),
             image_holder: None,
+            input_sender: None,
+            pressed_button: None,
         }
         .to_ref()
     }
@@ -219,22 +323,54 @@ impl ElementBackend for SpiceBackend {
     }
 
     fn render(&mut self) -> RenderFn {
-        let img = some_or_return!(self.image_holder.clone(), RenderFn::empty());
-        let el = ok_or_return!(self.element_weak.upgrade_mut(), RenderFn::empty());
-        let (width, height) = el.get_size();
-        let (img_width, img_height) = (img.width()  as f32, img.height() as f32);
+        let data = some_or_return!(self.get_render_data(), RenderFn::empty());
         RenderFn::new(move |canvas| {
-            let mut w = width;
-            let mut h = w / img_width * img_height;
-            if h > height {
-                h = height;
-                w = img_width / img_height * h;
-            }
-            let x = (width - w) / 2.0;
-            let y = (height - h) / 2.0;
-            let dst_rect = Rect::new(x, y, w, h);
             let options = SamplingOptions::new(FilterMode::Linear, MipmapMode::None);
-            canvas.draw_image_rect_with_sampling_options(&img, None, &dst_rect.to_skia_rect(), options, &Paint::default());
+            canvas.draw_image_rect_with_sampling_options(&data.img, None, &data.render_rect.to_skia_rect(), options, &Paint::default());
         })
     }
+
+    fn on_event(&mut self, event: Box<&mut dyn Any>, ctx: &mut EventContext<ElementWeak>) {
+        let sender = some_or_return!(&self.input_sender);
+        let render_data = some_or_return!(self.get_render_data());
+        if let Some(e) = event.downcast_ref::<MouseDownEvent>() {
+            let b = some_or_return!(map_deft_button_to_spice(e.0.button));
+            sender.send(InputEvent::ButtonPress(b)).unwrap();
+            self.pressed_button = Some(b);
+        } else if let Some(e) = event.downcast_ref::<MouseUpEvent>() {
+            let b = some_or_return!(map_deft_button_to_spice(e.0.button));
+            sender.send(InputEvent::ButtonRelease(b)).unwrap();
+            self.pressed_button = None;
+        } else if let Some(e) = event.downcast_ref::<MouseMoveEvent>() {
+            let x = (e.0.offset_x - render_data.render_rect.x) / render_data.scale;
+            let y = (e.0.offset_y - render_data.render_rect.y) / render_data.scale;
+            sender.send(InputEvent::Position(x as i32, y as i32, self.pressed_button)).unwrap();
+        } else if let Some(e) = event.downcast_ref::<KeyDownEvent>() {
+            let scancode = some_or_return!(e.0.scancode);
+            sender.send(InputEvent::KeyPress(scancode)).unwrap();
+        } else if let Some(e) = event.downcast_ref::<KeyUpEvent>() {
+            let scancode = some_or_return!(e.0.scancode);
+            sender.send(InputEvent::KeyRelease(scancode)).unwrap();
+        }
+    }
 }
+
+fn map_deft_button_to_spice(button: i32) -> Option<MouseButton> {
+    let b = match button {
+        1 => MouseButton::Left,
+        2 => MouseButton::Right,
+        3 => MouseButton::Middle,
+        _ => return None
+    };
+    Some(b)
+}
+
+fn get_button_mask(b: MouseButton) -> i32 {
+    match b {
+        MouseButton::Left => MouseButtonMask::LEFT.bits(),
+        MouseButton::Middle => MouseButtonMask::MIDDLE.bits(),
+        MouseButton::Right => MouseButtonMask::RIGHT.bits(),
+        _ => 0,
+    }
+}
+

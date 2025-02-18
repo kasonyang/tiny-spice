@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-deft = "0.2.0"
+deft = "0.2.7"
 deft-macros = "0.2.0"
 deft-skia-safe = "0.81.1"
 serde = "1.0.217"
